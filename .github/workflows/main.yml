@@ -1,0 +1,71 @@
+      - name: Prepare fake-labels and set hostname + network adapter
+        shell: powershell
+        run: |
+          # Choose a random "label" to include in hostname (this is ONLY a string label; not real hardware spoof)
+          $models = @(
+            "amd-epyc-7763",
+            "intel-xeon-6248",
+            "amd-ryzen-5950x",
+            "intel-core-i9-12900k",
+            "intel-xeon-8380"
+          )
+          # pick one at random, then add a random suffix
+          $pick = $models | Get-Random
+          $rand = -join ((48..57) + (97..122) | Get-Random -Count 4 | ForEach-Object {[char]$_})
+          $friendlyModel = "$pick-sim-$rand"
+
+          # Create a unique hostname (Windows computer name)
+          $newHost = "gh-$friendlyModel-$((Get-Random -Minimum 100 -Maximum 9999))"
+          Write-Host "Setting hostname to: $newHost"
+
+          # Set computer name for this session (will try to rename; requires reboot to fully take effect for some services)
+          Try {
+            Rename-Computer -NewName $newHost -Force -ErrorAction Stop
+            Write-Host "Rename-Computer succeeded (may require reboot to apply fully)."
+          } Catch {
+            Write-Warning "Rename-Computer failed (continuing). $_"
+          }
+
+          # Rename the first Ethernet / active adapter friendly name so UI shows different adapter name
+          $adapters = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+          if ($adapters) {
+            $newAdapterName = "eth-$friendlyModel-$((Get-Random -Minimum 10 -Maximum 99))"
+            Try {
+              Rename-NetAdapter -Name $adapters.Name -NewName $newAdapterName -Confirm:$false -ErrorAction Stop
+              Write-Host "Renamed adapter '$($adapters.Name)' -> '$newAdapterName'"
+            } Catch {
+              Write-Warning "Adapter rename failed: $_"
+            }
+          } else {
+            Write-Host "No active network adapter found to rename."
+          }
+
+          # Export values for later steps
+          echo "SIM_MODEL=$friendlyModel" >> $env:GITHUB_ENV
+          echo "NEW_HOSTNAME=$newHost" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale (unchanged)
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection with labeled hostname
+        run: |
+          $hostnameLabel = $env:NEW_HOSTNAME
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="$hostnameLabel" --accept-routes
+          Start-Sleep -Seconds 6
+          $IP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          # prefer the 100.* address if present
+          if ($IP -match '100\.\d+\.\d+\.\d+') { $found = $Matches[0] } else { $found = $IP }
+          echo "TAILSCALE_IP=$found" >> $env:GITHUB_ENV
+          Write-Host "Tailscale node: $hostnameLabel"
+          Write-Host "Tailscale IP: $found"
+
+      - name: Verify and Print (unchanged)
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"

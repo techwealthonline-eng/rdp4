@@ -1,0 +1,142 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          # Enable Remote Desktop and (optionally) relax NLA/SecurityLayer if needed
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # NOTE: Disabling NLA is insecure; kept here because original requested. Remove if not needed.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+
+          # Allow incoming connections on port 3389 (Private/Domain)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=Private,Domain
+
+          # Restart RDP service to apply some changes
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          # Generate a reasonably strong random password
+          $chars = (33..126) | ForEach-Object {[char]$_}
+          $password = -join ((1..16) | ForEach-Object { $chars | Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # Export credentials to environment for later steps (log will show them)
+          Write-Host "RDP user created or updated."
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Prepare safe labels and rename hostname/adapter (appearance only)
+        shell: powershell
+        run: |
+          # Pick a friendly label (this is only a string label — not hardware spoofing)
+          $models = @("amd-epyc-7763","intel-xeon-6248","amd-ryzen-5950x","intel-core-i9-12900k","intel-xeon-8380")
+          $pick = $models | Get-Random
+          $rand = -join ((48..57) + (97..122) | Get-Random -Count 4 | ForEach-Object {[char]$_})
+          $friendlyModel = "$pick-sim-$rand"
+          $newHost = "gh-$friendlyModel-$((Get-Random -Minimum 100 -Maximum 9999))"
+          Write-Host "Desired hostname (label): $newHost"
+
+          # Attempt to rename computer (may require reboot for full effect)
+          Try {
+            Rename-Computer -NewName $newHost -Force -ErrorAction Stop
+            Write-Host "Rename-Computer succeeded (may need reboot for full system effect)."
+          } Catch {
+            Write-Warning "Rename-Computer failed or not permitted. Continuing without reboot."
+          }
+
+          # Rename the first active network adapter's friendly name (appearance only)
+          $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+          if ($adapter) {
+            $newAdapterName = "eth-$friendlyModel-$((Get-Random -Minimum 10 -Maximum 99))"
+            Try {
+              Rename-NetAdapter -Name $adapter.Name -NewName $newAdapterName -Confirm:$false -ErrorAction Stop
+              Write-Host "Renamed adapter '$($adapter.Name)' -> '$newAdapterName'"
+            } Catch {
+              Write-Warning "Adapter rename failed: $_"
+            }
+          } else {
+            Write-Host "No active adapter found to rename."
+          }
+
+          echo "SIM_MODEL=$friendlyModel" >> $env:GITHUB_ENV
+          echo "NEW_HOSTNAME=$newHost" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection (with labeled hostname)
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $hostnameLabel = $env:NEW_HOSTNAME
+          if (-not $hostnameLabel) { $hostnameLabel = "gh-runner-$((Get-Random -Minimum 1000 -Maximum 9999))" }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="$hostnameLabel" --accept-routes 2>&1 | Write-Host
+          Start-Sleep -Seconds 6
+          $allips = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) -join ","
+          $allips = $allips.Trim()
+          if ($allips -match '100\.\d+\.\d+\.\d+') {
+            $match = $Matches[0]
+            echo "TAILSCALE_IP=$match" >> $env:GITHUB_ENV
+          } else {
+            echo "TAILSCALE_IP=$allips" >> $env:GITHUB_ENV
+          }
+          Write-Host "Tailscale hostname: $hostnameLabel"
+          Write-Host "Tailscale raw IPs: $allips"
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          if (-not $env:TAILSCALE_IP) { Write-Error "No Tailscale IP found"; exit 1 }
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel "Quiet"
+          if (-not $testResult) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection (print info)
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $((Get-Content env:GITHUB_ENV -ErrorAction SilentlyContinue) -match 'RDP_CREDS=(.*)'; $Matches[1])"
+          Write-Host "SIM_MODEL: $env:SIM_MODEL"
+          Write-Host "NEW_HOSTNAME: $env:NEW_HOSTNAME"
+          Write-Host "==================`n"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
